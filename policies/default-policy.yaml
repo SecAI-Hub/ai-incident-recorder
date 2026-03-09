@@ -1,0 +1,35 @@
+version: 1
+
+recorder:
+  data_dir: /var/lib/secure-ai/incidents
+
+  # Event retention limits
+  retention:
+    max_events_per_session: 10000
+    max_sessions: 1000
+    expire_after_days: 90
+
+  # PII/credential redaction
+  redaction:
+    # Redact when packaging case bundles (recommended: true)
+    on_package: true
+    # Redact at recording time (privacy-first mode; loses raw evidence)
+    on_record: false
+    # Which patterns to apply (empty = all)
+    patterns:
+      - ssn
+      - email
+      - credential
+      - bearer_token
+      - credit_card
+
+  # Signing key for case bundles
+  signing_key: /etc/secure-ai/keys/recorder.key
+
+  # Daemon mode settings
+  daemon:
+    bind_addr: "127.0.0.1:8495"
+
+  # Rate limiting for daemon API
+  rate_limit:
+    requests_per_minute: 120
