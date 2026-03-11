@@ -26,12 +26,13 @@ type RecorderPolicy struct {
 }
 
 type RecorderConfig struct {
-	DataDir   string          `yaml:"data_dir"`
-	Retention RetentionConfig `yaml:"retention"`
-	Redaction RedactionConfig `yaml:"redaction"`
-	SigningKey string         `yaml:"signing_key"`
-	Daemon    DaemonConfig    `yaml:"daemon"`
-	RateLimit RateLimitConfig `yaml:"rate_limit"`
+	DataDir         string                           `yaml:"data_dir"`
+	Retention       RetentionConfig                  `yaml:"retention"`
+	Redaction       RedactionConfig                  `yaml:"redaction"`
+	PrivacyProfiles map[string]PrivacyProfileConfig  `yaml:"privacy_profiles"`
+	SigningKey       string                           `yaml:"signing_key"`
+	Daemon          DaemonConfig                     `yaml:"daemon"`
+	RateLimit       RateLimitConfig                  `yaml:"rate_limit"`
 }
 
 type RetentionConfig struct {
@@ -47,7 +48,9 @@ type RedactionConfig struct {
 }
 
 type DaemonConfig struct {
-	BindAddr string `yaml:"bind_addr"`
+	BindAddr        string `yaml:"bind_addr"`
+	ReadTimeoutSec  int    `yaml:"read_timeout_seconds"`
+	WriteTimeoutSec int    `yaml:"write_timeout_seconds"`
 }
 
 type RateLimitConfig struct {
@@ -272,8 +275,8 @@ func handleRecordEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if event.Source == "" || event.Type == "" {
-		http.Error(w, "source and type are required", http.StatusBadRequest)
+	if err := validateEvent(event); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -324,14 +327,23 @@ func handleRecordBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pol := getPolicy()
+
 	var recorded []Event
 	for _, event := range events {
-		if event.Source == "" || event.Type == "" {
+		if err := validateEvent(event); err != nil {
 			continue
 		}
 		if event.SessionID == "" {
 			event.SessionID = "default"
 		}
+
+		// Apply on-record redaction (consistent with single event handler).
+		if pol.Recorder.Redaction.OnRecord {
+			stats := &RedactionStats{Counts: make(map[string]int)}
+			event = RedactEvent(event, defaultRedactionRules, stats)
+		}
+
 		e, err := eventStore.Record(event)
 		if err != nil {
 			log.Printf("error recording batch event: %v", err)
@@ -407,8 +419,8 @@ func handleCreateIncident(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if inc.Title == "" {
-		http.Error(w, "title is required", http.StatusBadRequest)
+	if err := validateIncident(inc); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -495,11 +507,10 @@ func handlePackageBundle(w http.ResponseWriter, r *http.Request) {
 	events := eventStore.Query(EventFilter{SessionID: inc.SessionID})
 
 	pol := getPolicy()
-	bundle, err := PackageBundle(inc, events,
-		pol.Recorder.Redaction.OnPackage,
-		pol.Recorder.Redaction.Patterns,
-		pol.Recorder.SigningKey,
-	)
+	profileName := r.URL.Query().Get("profile")
+	profile := resolvePrivacyProfile(pol, profileName)
+
+	bundle, err := PackageBundle(inc, events, profile, pol.Recorder.SigningKey)
 	if err != nil {
 		log.Printf("error packaging bundle: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -541,6 +552,45 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
+// Privacy profile resolution
+// ---------------------------------------------------------------------------
+
+// resolvePrivacyProfile returns a profile config by name, or falls back to
+// the legacy redaction config.
+func resolvePrivacyProfile(pol RecorderPolicy, name string) PrivacyProfileConfig {
+	if name != "" && pol.Recorder.PrivacyProfiles != nil {
+		if p, ok := pol.Recorder.PrivacyProfiles[name]; ok {
+			return p
+		}
+	}
+	return PrivacyProfileConfig{
+		Redact:   pol.Recorder.Redaction.OnPackage,
+		Patterns: pol.Recorder.Redaction.Patterns,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Route multiplexer (exported for testing)
+// ---------------------------------------------------------------------------
+
+// buildMux constructs the HTTP mux with auth on all non-health endpoints.
+func buildMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", handleHealth)
+	mux.HandleFunc("/v1/event", requireServiceToken(handleRecordEvent))
+	mux.HandleFunc("/v1/events", requireServiceToken(handleQueryEvents))
+	mux.HandleFunc("/v1/events/batch", requireServiceToken(handleRecordBatch))
+	mux.HandleFunc("/v1/sessions", requireServiceToken(handleListSessions))
+	mux.HandleFunc("/v1/incident", requireServiceToken(handleGetIncident))
+	mux.HandleFunc("/v1/incidents", requireServiceToken(handleListIncidents))
+	mux.HandleFunc("/v1/incident/create", requireServiceToken(handleCreateIncident))
+	mux.HandleFunc("/v1/incident/package", requireServiceToken(handlePackageBundle))
+	mux.HandleFunc("/v1/reload", requireServiceToken(handleReload))
+	mux.HandleFunc("/v1/metrics", requireServiceToken(handleMetrics))
+	return mux
+}
+
+// ---------------------------------------------------------------------------
 // Daemon mode
 // ---------------------------------------------------------------------------
 
@@ -548,21 +598,28 @@ func runDaemon(bindAddr string) {
 	loadServiceToken()
 	initAuditLog()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", handleHealth)
-	mux.HandleFunc("/v1/event", handleRecordEvent)
-	mux.HandleFunc("/v1/events", handleQueryEvents)
-	mux.HandleFunc("/v1/events/batch", handleRecordBatch)
-	mux.HandleFunc("/v1/sessions", handleListSessions)
-	mux.HandleFunc("/v1/incident", handleGetIncident)
-	mux.HandleFunc("/v1/incidents", handleListIncidents)
-	mux.HandleFunc("/v1/incident/create", requireServiceToken(handleCreateIncident))
-	mux.HandleFunc("/v1/incident/package", requireServiceToken(handlePackageBundle))
-	mux.HandleFunc("/v1/reload", requireServiceToken(handleReload))
-	mux.HandleFunc("/v1/metrics", handleMetrics)
+	pol := getPolicy()
+
+	readTimeout := time.Duration(pol.Recorder.Daemon.ReadTimeoutSec) * time.Second
+	if readTimeout <= 0 {
+		readTimeout = 30 * time.Second
+	}
+	writeTimeout := time.Duration(pol.Recorder.Daemon.WriteTimeoutSec) * time.Second
+	if writeTimeout <= 0 {
+		writeTimeout = 60 * time.Second
+	}
+
+	mux := buildMux()
+
+	srv := &http.Server{
+		Addr:         bindAddr,
+		Handler:      mux,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+	}
 
 	log.Printf("ai-incident-recorder daemon listening on %s (events: %d)", bindAddr, eventStore.EventCount())
-	if err := http.ListenAndServe(bindAddr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
@@ -578,9 +635,10 @@ func cmdRecord(policyPath, bindAddr string) int {
 		return 1
 	}
 
+	pol := getPolicy()
 	dataDir := getDataDir()
 	var err error
-	eventStore, err = NewEventStore(dataDir)
+	eventStore, err = NewEventStore(dataDir, pol.Recorder.Retention)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error opening event store: %v\n", err)
 		return 1
@@ -594,7 +652,7 @@ func cmdRecord(policyPath, bindAddr string) int {
 	}
 
 	if bindAddr == "" {
-		bindAddr = getPolicy().Recorder.Daemon.BindAddr
+		bindAddr = pol.Recorder.Daemon.BindAddr
 		if bindAddr == "" {
 			bindAddr = defaultBindAddr
 		}
@@ -611,9 +669,10 @@ func cmdIngest(policyPath, filePath, source, sessionID string) int {
 		return 1
 	}
 
+	pol := getPolicy()
 	dataDir := getDataDir()
 	var err error
-	eventStore, err = NewEventStore(dataDir)
+	eventStore, err = NewEventStore(dataDir, pol.Recorder.Retention)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error opening event store: %v\n", err)
 		return 1
@@ -675,12 +734,13 @@ func cmdList(policyPath, what string) int {
 		return 1
 	}
 
+	pol := getPolicy()
 	dataDir := getDataDir()
 	var err error
 
 	switch what {
 	case "sessions":
-		eventStore, err = NewEventStore(dataDir)
+		eventStore, err = NewEventStore(dataDir, pol.Recorder.Retention)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			return 1
@@ -729,6 +789,7 @@ func cmdShow(policyPath, incidentID string) int {
 		return 1
 	}
 
+	pol := getPolicy()
 	dataDir := getDataDir()
 	var err error
 
@@ -744,7 +805,7 @@ func cmdShow(policyPath, incidentID string) int {
 		return 1
 	}
 
-	eventStore, err = NewEventStore(dataDir)
+	eventStore, err = NewEventStore(dataDir, pol.Recorder.Retention)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -781,13 +842,14 @@ func cmdShow(policyPath, incidentID string) int {
 	return 0
 }
 
-func cmdPackage(policyPath, incidentID, outputPath, keyPath string) int {
+func cmdPackage(policyPath, incidentID, outputPath, keyPath, profileName string) int {
 	os.Setenv("POLICY_PATH", policyPath)
 	if err := loadPolicy(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
 
+	pol := getPolicy()
 	dataDir := getDataDir()
 	var err error
 
@@ -803,7 +865,7 @@ func cmdPackage(policyPath, incidentID, outputPath, keyPath string) int {
 		return 1
 	}
 
-	eventStore, err = NewEventStore(dataDir)
+	eventStore, err = NewEventStore(dataDir, pol.Recorder.Retention)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -811,17 +873,14 @@ func cmdPackage(policyPath, incidentID, outputPath, keyPath string) int {
 	defer eventStore.Close()
 
 	events := eventStore.Query(EventFilter{SessionID: inc.SessionID})
-	pol := getPolicy()
 
 	if keyPath != "" {
 		pol.Recorder.SigningKey = keyPath
 	}
 
-	bundle, err := PackageBundle(inc, events,
-		pol.Recorder.Redaction.OnPackage,
-		pol.Recorder.Redaction.Patterns,
-		pol.Recorder.SigningKey,
-	)
+	profile := resolvePrivacyProfile(pol, profileName)
+
+	bundle, err := PackageBundle(inc, events, profile, pol.Recorder.SigningKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error packaging: %v\n", err)
 		return 1
@@ -986,12 +1045,13 @@ func main() {
 		id := fs.String("id", "", "incident ID")
 		output := fs.String("output", "-", "output file (- for stdout)")
 		key := fs.String("key", "", "signing key path (overrides policy)")
+		profileName := fs.String("profile", "", "privacy profile name (internal, external-share, legal-review)")
 		fs.Parse(os.Args[2:])
 		if *id == "" {
 			fmt.Fprintf(os.Stderr, "error: -id is required\n")
 			os.Exit(1)
 		}
-		os.Exit(cmdPackage(*policyPath, *id, *output, *key))
+		os.Exit(cmdPackage(*policyPath, *id, *output, *key, *profileName))
 
 	case "verify":
 		fs := flag.NewFlagSet("verify", flag.ExitOnError)

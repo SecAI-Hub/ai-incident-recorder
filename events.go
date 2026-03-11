@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -34,10 +35,10 @@ type Event struct {
 
 // SessionSummary describes a recording session.
 type SessionSummary struct {
-	SessionID  string `json:"session_id"`
-	EventCount int    `json:"event_count"`
-	FirstEvent string `json:"first_event"`
-	LastEvent  string `json:"last_event"`
+	SessionID  string   `json:"session_id"`
+	EventCount int      `json:"event_count"`
+	FirstEvent string   `json:"first_event"`
+	LastEvent  string   `json:"last_event"`
 	Sources    []string `json:"sources"`
 }
 
@@ -124,16 +125,17 @@ func verifyEventChain(events []Event) error {
 
 // EventStore manages event persistence and querying.
 type EventStore struct {
-	mu       sync.RWMutex
-	events   []Event
-	sessions map[string][]int // session_id -> event indices
-	filePath string
-	file     *os.File
-	lastHash string
+	mu        sync.RWMutex
+	events    []Event
+	sessions  map[string][]int // session_id -> event indices
+	filePath  string
+	file      *os.File
+	lastHash  string
+	retention RetentionConfig
 }
 
 // NewEventStore creates or opens an event store at the given data directory.
-func NewEventStore(dataDir string) (*EventStore, error) {
+func NewEventStore(dataDir string, retention RetentionConfig) (*EventStore, error) {
 	eventsDir := dataDir
 	if err := os.MkdirAll(eventsDir, 0750); err != nil {
 		return nil, fmt.Errorf("create events dir: %w", err)
@@ -142,18 +144,20 @@ func NewEventStore(dataDir string) (*EventStore, error) {
 	filePath := eventsDir + "/events.jsonl"
 
 	store := &EventStore{
-		sessions: make(map[string][]int),
-		filePath: filePath,
+		sessions:  make(map[string][]int),
+		filePath:  filePath,
+		retention: retention,
 	}
 
-	// Load existing events.
+	// Load existing events (corruption-tolerant: skip bad lines).
 	if data, err := os.ReadFile(filePath); err == nil {
-		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		for lineNum, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 			if line == "" {
 				continue
 			}
 			var e Event
 			if err := json.Unmarshal([]byte(line), &e); err != nil {
+				log.Printf("warning: skipping corrupt event at line %d: %v", lineNum+1, err)
 				continue
 			}
 			idx := len(store.events)
@@ -174,9 +178,26 @@ func NewEventStore(dataDir string) (*EventStore, error) {
 }
 
 // Record adds an event to the store with ID, timestamp, and hash chain.
+// Enforces retention limits (max_events_per_session, max_sessions).
 func (s *EventStore) Record(e Event) (Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Enforce retention: max events per session.
+	if s.retention.MaxEventsPerSession > 0 {
+		if len(s.sessions[e.SessionID]) >= s.retention.MaxEventsPerSession {
+			return Event{}, fmt.Errorf("session %q at max events (%d)", e.SessionID, s.retention.MaxEventsPerSession)
+		}
+	}
+
+	// Enforce retention: max sessions.
+	if s.retention.MaxSessions > 0 && e.SessionID != "" {
+		if _, exists := s.sessions[e.SessionID]; !exists {
+			if len(s.sessions) >= s.retention.MaxSessions {
+				return Event{}, fmt.Errorf("max sessions reached (%d)", s.retention.MaxSessions)
+			}
+		}
+	}
 
 	// Assign metadata.
 	if e.ID == "" {
@@ -201,6 +222,10 @@ func (s *EventStore) Record(e Event) (Event, error) {
 	if _, err := s.file.Write(append(data, '\n')); err != nil {
 		return e, fmt.Errorf("write event: %w", err)
 	}
+	// fsync to ensure durability.
+	if err := s.file.Sync(); err != nil {
+		return e, fmt.Errorf("sync event file: %w", err)
+	}
 
 	// Update in-memory index.
 	idx := len(s.events)
@@ -212,11 +237,28 @@ func (s *EventStore) Record(e Event) (Event, error) {
 }
 
 // Query returns events matching the filter criteria.
+// Time filtering uses parsed timestamps for correctness across formats.
 func (s *EventStore) Query(filter EventFilter) []Event {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var results []Event
+
+	// Parse filter timestamps once (outside the loop).
+	var afterTime, beforeTime time.Time
+	var hasAfter, hasBefore bool
+	if filter.After != "" {
+		if t, ok := parseTimestamp(filter.After); ok {
+			afterTime = t
+			hasAfter = true
+		}
+	}
+	if filter.Before != "" {
+		if t, ok := parseTimestamp(filter.Before); ok {
+			beforeTime = t
+			hasBefore = true
+		}
+	}
 
 	// If filtering by session, use the index.
 	var candidates []Event
@@ -242,11 +284,19 @@ func (s *EventStore) Query(filter EventFilter) []Event {
 		if filter.Severity != "" && e.Severity != filter.Severity {
 			continue
 		}
-		if filter.After != "" && e.Timestamp < filter.After {
-			continue
+		if hasAfter {
+			if et, ok := parseTimestamp(e.Timestamp); ok {
+				if et.Before(afterTime) {
+					continue
+				}
+			}
 		}
-		if filter.Before != "" && e.Timestamp > filter.Before {
-			continue
+		if hasBefore {
+			if et, ok := parseTimestamp(e.Timestamp); ok {
+				if et.After(beforeTime) {
+					continue
+				}
+			}
 		}
 		results = append(results, e)
 		if filter.Limit > 0 && len(results) >= filter.Limit {
