@@ -51,6 +51,7 @@ type DaemonConfig struct {
 	BindAddr        string `yaml:"bind_addr"`
 	ReadTimeoutSec  int    `yaml:"read_timeout_seconds"`
 	WriteTimeoutSec int    `yaml:"write_timeout_seconds"`
+	IdleTimeoutSec  int    `yaml:"idle_timeout_seconds"`
 }
 
 type RateLimitConfig struct {
@@ -608,6 +609,22 @@ func runDaemon(bindAddr string) {
 	if writeTimeout <= 0 {
 		writeTimeout = 60 * time.Second
 	}
+	idleTimeout := time.Duration(pol.Recorder.Daemon.IdleTimeoutSec) * time.Second
+	if idleTimeout <= 0 {
+		idleTimeout = 120 * time.Second
+	}
+
+	// Start periodic TTL purge if configured.
+	if pol.Recorder.Retention.ExpireAfterDays > 0 {
+		go func() {
+			ticker := time.NewTicker(1 * time.Hour)
+			defer ticker.Stop()
+			for range ticker.C {
+				eventStore.PurgeExpired()
+			}
+		}()
+		log.Printf("TTL purge enabled: expire_after_days=%d", pol.Recorder.Retention.ExpireAfterDays)
+	}
 
 	mux := buildMux()
 
@@ -616,6 +633,7 @@ func runDaemon(bindAddr string) {
 		Handler:      mux,
 		ReadTimeout:  readTimeout,
 		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
 	}
 
 	log.Printf("ai-incident-recorder daemon listening on %s (events: %d)", bindAddr, eventStore.EventCount())

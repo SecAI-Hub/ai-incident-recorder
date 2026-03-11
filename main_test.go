@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -240,6 +241,42 @@ func TestRetention_MaxEventsPerSession(t *testing.T) {
 	_, err = store.Record(Event{SessionID: "s2", Source: "a", Type: "t"})
 	if err != nil {
 		t.Fatalf("different session should succeed: %v", err)
+	}
+}
+
+func TestRetention_ExpireAfterDays(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write events with old timestamps directly to the file.
+	filePath := dir + "/events.jsonl"
+	oldTS := time.Now().UTC().Add(-100 * 24 * time.Hour).Format(time.RFC3339Nano)
+	recentTS := time.Now().UTC().Add(-10 * 24 * time.Hour).Format(time.RFC3339Nano)
+
+	oldEvent := Event{ID: "old-1", Timestamp: oldTS, SessionID: "s1", Source: "a", Type: "t", Severity: "info", Hash: "fakehash1"}
+	recentEvent := Event{ID: "new-1", Timestamp: recentTS, SessionID: "s1", Source: "a", Type: "t", Severity: "info", Hash: "fakehash2"}
+
+	f, _ := os.Create(filePath)
+	data1, _ := json.Marshal(oldEvent)
+	data2, _ := json.Marshal(recentEvent)
+	f.Write(append(data1, '\n'))
+	f.Write(append(data2, '\n'))
+	f.Close()
+
+	// Open store with 90-day TTL -- should purge the 100-day-old event.
+	store, err := NewEventStore(dir, RetentionConfig{ExpireAfterDays: 90})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if store.EventCount() != 1 {
+		t.Fatalf("expected 1 event after TTL purge, got %d", store.EventCount())
+	}
+
+	// The remaining event should be the recent one.
+	events := store.Query(EventFilter{SessionID: "s1"})
+	if len(events) != 1 || events[0].ID != "new-1" {
+		t.Fatalf("expected recent event to survive, got %v", events)
 	}
 }
 

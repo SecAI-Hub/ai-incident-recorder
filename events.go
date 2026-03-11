@@ -167,6 +167,11 @@ func NewEventStore(dataDir string, retention RetentionConfig) (*EventStore, erro
 		}
 	}
 
+	// Purge expired events before opening for writes.
+	if retention.ExpireAfterDays > 0 {
+		store.purgeExpired()
+	}
+
 	// Open file for appending.
 	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
 	if err != nil {
@@ -175,6 +180,72 @@ func NewEventStore(dataDir string, retention RetentionConfig) (*EventStore, erro
 	store.file = f
 
 	return store, nil
+}
+
+// purgeExpired removes events older than the configured TTL and rewrites the file.
+func (s *EventStore) purgeExpired() {
+	if s.retention.ExpireAfterDays <= 0 {
+		return
+	}
+
+	cutoff := time.Now().UTC().Add(-time.Duration(s.retention.ExpireAfterDays) * 24 * time.Hour)
+	var kept []Event
+
+	for _, e := range s.events {
+		ts, ok := parseTimestamp(e.Timestamp)
+		if ok && ts.Before(cutoff) {
+			continue // expired
+		}
+		kept = append(kept, e)
+	}
+
+	removed := len(s.events) - len(kept)
+	if removed == 0 {
+		return
+	}
+
+	// Rebuild in-memory state.
+	s.events = kept
+	s.sessions = make(map[string][]int)
+	s.lastHash = ""
+	for i, e := range s.events {
+		s.sessions[e.SessionID] = append(s.sessions[e.SessionID], i)
+		s.lastHash = e.Hash
+	}
+
+	// Rewrite the file.
+	if err := s.rewriteFile(); err != nil {
+		log.Printf("warning: failed to rewrite events after purge: %v", err)
+		return
+	}
+
+	log.Printf("purged %d expired events (cutoff=%s)", removed, cutoff.Format(time.RFC3339))
+}
+
+// PurgeExpired is the exported version for use by the daemon's periodic ticker.
+func (s *EventStore) PurgeExpired() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.purgeExpired()
+}
+
+// rewriteFile replaces the events JSONL file with current in-memory state.
+func (s *EventStore) rewriteFile() error {
+	tmpPath := s.filePath + ".tmp"
+	tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
+	if err != nil {
+		return err
+	}
+	for _, e := range s.events {
+		data, _ := json.Marshal(e)
+		tmp.Write(append(data, '\n'))
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	tmp.Close()
+	return os.Rename(tmpPath, s.filePath)
 }
 
 // Record adds an event to the store with ID, timestamp, and hash chain.
