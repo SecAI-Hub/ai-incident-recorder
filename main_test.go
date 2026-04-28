@@ -45,6 +45,18 @@ func setupTestStores(t *testing.T) string {
 	policyMu.Unlock()
 
 	serviceToken = ""
+	t.Cleanup(func() {
+		if eventStore != nil {
+			eventStore.Close()
+			eventStore = nil
+		}
+		incidentStore = nil
+		serviceToken = ""
+		if auditFile != nil {
+			auditFile.Close()
+			auditFile = nil
+		}
+	})
 	return dir
 }
 
@@ -76,6 +88,18 @@ func setupTestStoresWithRetention(t *testing.T, ret RetentionConfig) string {
 	policyMu.Unlock()
 
 	serviceToken = ""
+	t.Cleanup(func() {
+		if eventStore != nil {
+			eventStore.Close()
+			eventStore = nil
+		}
+		incidentStore = nil
+		serviceToken = ""
+		if auditFile != nil {
+			auditFile.Close()
+			auditFile = nil
+		}
+	})
 	return dir
 }
 
