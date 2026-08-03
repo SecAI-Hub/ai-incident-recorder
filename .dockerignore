@@ -1,0 +1,7 @@
+.git
+.github
+*.key
+*.pub
+*.jsonl
+incidents/
+ai-incident-recorder

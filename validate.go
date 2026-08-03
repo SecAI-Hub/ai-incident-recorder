@@ -35,8 +35,11 @@ func validateEvent(e Event) error {
 	if e.Severity != "" && !validSeverities[e.Severity] {
 		return fmt.Errorf("invalid severity: %s (must be info, warning, alert, or critical)", e.Severity)
 	}
-	if e.SessionID != "" && len(e.SessionID) > maxSessionIDLen {
+	if len(e.SessionID) > maxSessionIDLen {
 		return fmt.Errorf("session_id too long (%d chars, max %d)", len(e.SessionID), maxSessionIDLen)
+	}
+	if e.SessionID != "" && !reIdentifier.MatchString(e.SessionID) {
+		return fmt.Errorf("invalid session_id")
 	}
 	if e.Timestamp != "" {
 		if _, ok := parseTimestamp(e.Timestamp); !ok {
@@ -51,14 +54,30 @@ func validateIncident(inc Incident) error {
 	if inc.Title == "" {
 		return fmt.Errorf("title is required")
 	}
+	if len(inc.Title) > 512 || len(inc.Notes) > 64*1024 || len(inc.Tags) > 64 || len(inc.EventIDs) > 100000 {
+		return fmt.Errorf("incident fields exceed limits")
+	}
 	if inc.Severity != "" && !validSeverities[inc.Severity] {
 		return fmt.Errorf("invalid severity: %s", inc.Severity)
 	}
 	if inc.Status != "" && !validStatuses[inc.Status] {
 		return fmt.Errorf("invalid status: %s", inc.Status)
 	}
-	if inc.SessionID != "" && len(inc.SessionID) > maxSessionIDLen {
+	if len(inc.SessionID) > maxSessionIDLen {
 		return fmt.Errorf("session_id too long")
+	}
+	if inc.SessionID != "" && !reIdentifier.MatchString(inc.SessionID) {
+		return fmt.Errorf("invalid session_id")
+	}
+	for _, tag := range inc.Tags {
+		if !reIdentifier.MatchString(tag) {
+			return fmt.Errorf("invalid tag")
+		}
+	}
+	for _, id := range inc.EventIDs {
+		if !validObjectID(id) {
+			return fmt.Errorf("invalid event id")
+		}
 	}
 	return nil
 }

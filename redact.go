@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -48,6 +49,8 @@ var defaultRedactionRules = []RedactionRule{
 	},
 }
 
+var sensitiveJSONKey = regexp.MustCompile(`(?i)(password|secret|api[_-]?key|private[_-]?key|token|authorization|credential)`)
+
 // RedactionStats tracks how many redactions of each type were applied.
 type RedactionStats struct {
 	Counts map[string]int `json:"counts"`
@@ -73,8 +76,30 @@ func RedactMap(data map[string]interface{}, rules []RedactionRule, stats *Redact
 		return nil
 	}
 	redacted := make(map[string]interface{}, len(data))
-	for k, v := range data {
-		redacted[k] = redactValue(v, rules, stats)
+	keys := make([]string, 0, len(data))
+	for key := range data {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		redactedKey := RedactString(key, rules, stats)
+		if sensitiveJSONKey.MatchString(redactedKey) {
+			redactedKey = "[REDACTED:key]"
+			if stats != nil {
+				stats.Counts["json_key"]++
+			}
+		}
+		base := redactedKey
+		for suffix := 2; ; suffix++ {
+			if _, exists := redacted[redactedKey]; !exists {
+				break
+			}
+			redactedKey = fmt.Sprintf("%s#%d", base, suffix)
+			if stats != nil {
+				stats.Counts["key_collision"]++
+			}
+		}
+		redacted[redactedKey] = redactValue(data[key], rules, stats)
 	}
 	return redacted
 }
@@ -108,8 +133,12 @@ func RedactEvent(e Event, rules []RedactionRule, stats *RedactionStats) Event {
 // RedactEvents redacts a slice of events, returning new copies.
 func RedactEvents(events []Event, enabledPatterns []string) ([]Event, RedactionStats) {
 	stats := RedactionStats{Counts: make(map[string]int)}
+	rules := enabledRedactionRules(enabledPatterns)
+	redacted := redactEventsWithRules(events, rules, &stats)
+	return redacted, stats
+}
 
-	// Filter rules by enabled pattern names.
+func enabledRedactionRules(enabledPatterns []string) []RedactionRule {
 	var rules []RedactionRule
 	if len(enabledPatterns) == 0 {
 		rules = defaultRedactionRules
@@ -124,12 +153,25 @@ func RedactEvents(events []Event, enabledPatterns []string) ([]Event, RedactionS
 			}
 		}
 	}
+	return rules
+}
 
+func redactEventsWithRules(events []Event, rules []RedactionRule, stats *RedactionStats) []Event {
 	redacted := make([]Event, len(events))
 	for i, e := range events {
-		redacted[i] = RedactEvent(e, rules, &stats)
+		redacted[i] = RedactEvent(e, rules, stats)
 	}
-	return redacted, stats
+	return redacted
+}
+
+func RedactIncident(incident Incident, rules []RedactionRule, stats *RedactionStats) Incident {
+	redacted := cloneIncident(incident)
+	redacted.Title = RedactString(redacted.Title, rules, stats)
+	redacted.Notes = RedactString(redacted.Notes, rules, stats)
+	for index := range redacted.Tags {
+		redacted.Tags[index] = RedactString(redacted.Tags[index], rules, stats)
+	}
+	return redacted
 }
 
 // summarizeEvent generates a one-line human-readable summary of an event.

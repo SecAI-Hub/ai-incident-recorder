@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +18,8 @@ import (
 
 func setupTestStores(t *testing.T) string {
 	t.Helper()
+	auditRequired.Store(false)
+	auditHealthy.Store(false)
 	dir := t.TempDir()
 
 	var err error
@@ -44,7 +47,7 @@ func setupTestStores(t *testing.T) string {
 	}
 	policyMu.Unlock()
 
-	serviceToken = ""
+	serviceToken = "test-secret"
 	t.Cleanup(func() {
 		if eventStore != nil {
 			eventStore.Close()
@@ -56,12 +59,22 @@ func setupTestStores(t *testing.T) string {
 			auditFile.Close()
 			auditFile = nil
 		}
+		auditRequired.Store(false)
+		auditHealthy.Store(false)
 	})
 	return dir
 }
 
+func authenticatedTestRequest(method, target string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, target, body)
+	req.Header.Set("Authorization", "Bearer test-secret")
+	return req
+}
+
 func setupTestStoresWithRetention(t *testing.T, ret RetentionConfig) string {
 	t.Helper()
+	auditRequired.Store(false)
+	auditHealthy.Store(false)
 	dir := t.TempDir()
 
 	var err error
@@ -99,6 +112,8 @@ func setupTestStoresWithRetention(t *testing.T, ret RetentionConfig) string {
 			auditFile.Close()
 			auditFile = nil
 		}
+		auditRequired.Store(false)
+		auditHealthy.Store(false)
 	})
 	return dir
 }
@@ -181,6 +196,22 @@ func TestEventStore_Persistence(t *testing.T) {
 
 	if store2.EventCount() != 2 {
 		t.Fatalf("expected 2 persisted events, got %d", store2.EventCount())
+	}
+}
+
+func TestEventStoreWriteFailurePoisonsFutureWrites(t *testing.T) {
+	store, err := NewEventStore(t.TempDir(), RetentionConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Record(Event{SessionID: "s1", Source: "test", Type: "event"}); err == nil {
+		t.Fatal("write to closed store must fail")
+	}
+	if _, err := store.Record(Event{SessionID: "s1", Source: "test", Type: "event"}); err == nil || !strings.Contains(err.Error(), "poisoned") {
+		t.Fatalf("subsequent write must be refused by poisoned store: %v", err)
 	}
 }
 
@@ -276,10 +307,12 @@ func TestRetention_ExpireAfterDays(t *testing.T) {
 	oldTS := time.Now().UTC().Add(-100 * 24 * time.Hour).Format(time.RFC3339Nano)
 	recentTS := time.Now().UTC().Add(-10 * 24 * time.Hour).Format(time.RFC3339Nano)
 
-	oldEvent := Event{ID: "old-1", Timestamp: oldTS, SessionID: "s1", Source: "a", Type: "t", Severity: "info", Hash: "fakehash1"}
-	recentEvent := Event{ID: "new-1", Timestamp: recentTS, SessionID: "s1", Source: "a", Type: "t", Severity: "info", Hash: "fakehash2"}
+	oldEvent := Event{ID: "old-1", Timestamp: oldTS, SessionID: "s1", Source: "a", Type: "t", Severity: "info"}
+	oldEvent.Hash = computeEventHash(oldEvent)
+	recentEvent := Event{ID: "new-1", Timestamp: recentTS, SessionID: "s1", Source: "a", Type: "t", Severity: "info", PrevHash: oldEvent.Hash}
+	recentEvent.Hash = computeEventHash(recentEvent)
 
-	f, _ := os.Create(filePath)
+	f, _ := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	data1, _ := json.Marshal(oldEvent)
 	data2, _ := json.Marshal(recentEvent)
 	f.Write(append(data1, '\n'))
@@ -436,9 +469,17 @@ func TestRedactMap_Nested(t *testing.T) {
 	}
 
 	nested := redacted["nested"].(map[string]interface{})
-	token := nested["token"].(string)
-	if strings.Contains(token, "abc123def456") {
+	token := nested["[REDACTED:key]"].(string)
+	if strings.Contains(token, strings.Join([]string{"abc123", "def456"}, "")) {
 		t.Fatal("bearer token should be redacted")
+	}
+}
+
+func TestRedactMapKeysAreCollisionSafe(t *testing.T) {
+	stats := &RedactionStats{Counts: make(map[string]int)}
+	redacted := RedactMap(map[string]interface{}{"secret": "one", "token": "two"}, defaultRedactionRules, stats)
+	if len(redacted) != 2 || redacted["[REDACTED:key]"] == nil || redacted["[REDACTED:key]#2"] == nil {
+		t.Fatalf("sensitive key redaction lost data during collision: %#v", redacted)
 	}
 }
 
@@ -481,7 +522,7 @@ func TestBatchRedaction_ConsistentWithSingle(t *testing.T) {
 
 	// Record via single endpoint.
 	body := `{"session_id":"s1","source":"model","type":"model.invoke","data":{"prompt":"Contact admin@corp.com"}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/event", strings.NewReader(body))
+	req := authenticatedTestRequest(http.MethodPost, "/v1/event", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -494,7 +535,7 @@ func TestBatchRedaction_ConsistentWithSingle(t *testing.T) {
 
 	// Record via batch endpoint.
 	batchBody := `[{"session_id":"s2","source":"model","type":"model.invoke","data":{"prompt":"Contact admin@corp.com"}}]`
-	req = httptest.NewRequest(http.MethodPost, "/v1/events/batch", strings.NewReader(batchBody))
+	req = authenticatedTestRequest(http.MethodPost, "/v1/events/batch", strings.NewReader(batchBody))
 	req.Header.Set("Content-Type", "application/json")
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -661,6 +702,29 @@ func TestPackageBundle_SignedAndVerified(t *testing.T) {
 	}
 }
 
+func TestGenerateKeypairRefusesOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	privPath := filepath.Join(dir, "test.key")
+	pubPath := filepath.Join(dir, "test.pub")
+	if err := generateKeypair(privPath, pubPath); err != nil {
+		t.Fatalf("first keygen: %v", err)
+	}
+	before, err := os.ReadFile(privPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := generateKeypair(privPath, filepath.Join(dir, "second.pub")); err == nil {
+		t.Fatal("key generation must not overwrite an existing private key")
+	}
+	after, err := os.ReadFile(privPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("existing private key changed")
+	}
+}
+
 func TestPackageBundle_TamperDetection(t *testing.T) {
 	dir := t.TempDir()
 
@@ -724,6 +788,28 @@ func TestPackageBundle_Redaction(t *testing.T) {
 	}
 }
 
+func TestPackageBundle_RedactsIncidentMetadata(t *testing.T) {
+	incident := &Incident{
+		ID: "inc-1", SessionID: "s1", Title: "Contact admin@example.com",
+		Notes: "password=fixture-secret", Tags: []string{"admin@example.com"},
+	}
+	bundle, err := PackageBundle(incident, nil, PrivacyProfileConfig{Redact: true}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	if strings.Contains(text, "admin@example.com") || strings.Contains(text, "fixture-secret") {
+		t.Fatal("incident title, notes, or tags leaked into redacted bundle")
+	}
+	if bundle.Title != bundle.Incident.Title {
+		t.Fatal("bundle title and embedded incident title must remain consistent")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Privacy profile tests
 // ---------------------------------------------------------------------------
@@ -777,7 +863,10 @@ func TestResolvePrivacyProfile_Named(t *testing.T) {
 		},
 	}
 
-	profile := resolvePrivacyProfile(pol, "external-share")
+	profile, err := resolvePrivacyProfile(pol, "external-share")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !profile.Redact {
 		t.Fatal("expected Redact=true")
 	}
@@ -799,12 +888,21 @@ func TestResolvePrivacyProfile_FallbackToDefault(t *testing.T) {
 		},
 	}
 
-	profile := resolvePrivacyProfile(pol, "")
+	profile, err := resolvePrivacyProfile(pol, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !profile.Redact {
 		t.Fatal("expected Redact=true from fallback")
 	}
 	if len(profile.Patterns) != 3 {
 		t.Fatalf("expected 3 patterns from fallback, got %d", len(profile.Patterns))
+	}
+}
+
+func TestResolvePrivacyProfile_UnknownFailsClosed(t *testing.T) {
+	if _, err := resolvePrivacyProfile(RecorderPolicy{}, "missing"); err == nil {
+		t.Fatal("unknown privacy profile must not silently use weaker defaults")
 	}
 }
 
@@ -1022,7 +1120,7 @@ func TestEndpointsWorkWithValidAuth(t *testing.T) {
 
 	// Record an event with valid auth.
 	body := `{"session_id":"s1","source":"tool-firewall","type":"tool.decision","severity":"info"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/event", strings.NewReader(body))
+	req := authenticatedTestRequest(http.MethodPost, "/v1/event", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-secret")
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -1039,7 +1137,7 @@ func TestRecordEventEndpoint(t *testing.T) {
 	mux := buildMux()
 
 	body := `{"session_id":"test-sess","source":"tool-firewall","type":"tool.decision","severity":"info","data":{"tool":"fs.read","allowed":true}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/event", strings.NewReader(body))
+	req := authenticatedTestRequest(http.MethodPost, "/v1/event", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -1064,7 +1162,7 @@ func TestRecordEventEndpoint_ValidationRejectsInvalidSeverity(t *testing.T) {
 	mux := buildMux()
 
 	body := `{"source":"a","type":"t","severity":"bogus"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/event", strings.NewReader(body))
+	req := authenticatedTestRequest(http.MethodPost, "/v1/event", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -1079,7 +1177,7 @@ func TestRecordEventEndpoint_MissingFields(t *testing.T) {
 	mux := buildMux()
 
 	body := `{"session_id":"test"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/event", strings.NewReader(body))
+	req := authenticatedTestRequest(http.MethodPost, "/v1/event", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -1093,7 +1191,7 @@ func TestRecordEventEndpoint_WrongMethod(t *testing.T) {
 
 	mux := buildMux()
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/event", nil)
+	req := authenticatedTestRequest(http.MethodGet, "/v1/event", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -1112,7 +1210,7 @@ func TestQueryEventsEndpoint(t *testing.T) {
 
 	mux := buildMux()
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/events?session_id=s1", nil)
+	req := authenticatedTestRequest(http.MethodGet, "/v1/events?session_id=s1", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -1136,7 +1234,7 @@ func TestListSessionsEndpoint(t *testing.T) {
 
 	mux := buildMux()
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/sessions", nil)
+	req := authenticatedTestRequest(http.MethodGet, "/v1/sessions", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -1151,7 +1249,7 @@ func TestCreateIncidentEndpoint(t *testing.T) {
 	mux := buildMux()
 
 	body := `{"session_id":"s1","title":"Test Incident","severity":"alert"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/incident/create", strings.NewReader(body))
+	req := authenticatedTestRequest(http.MethodPost, "/v1/incident/create", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -1172,7 +1270,7 @@ func TestCreateIncidentEndpoint_MissingTitle(t *testing.T) {
 	mux := buildMux()
 
 	body := `{"session_id":"s1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/incident/create", strings.NewReader(body))
+	req := authenticatedTestRequest(http.MethodPost, "/v1/incident/create", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -1187,7 +1285,7 @@ func TestCreateIncidentEndpoint_InvalidSeverity(t *testing.T) {
 	mux := buildMux()
 
 	body := `{"title":"Test","severity":"panic"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/incident/create", strings.NewReader(body))
+	req := authenticatedTestRequest(http.MethodPost, "/v1/incident/create", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -1196,7 +1294,7 @@ func TestCreateIncidentEndpoint_InvalidSeverity(t *testing.T) {
 	}
 }
 
-func TestServiceToken_DevMode(t *testing.T) {
+func TestServiceToken_MissingFailsClosed(t *testing.T) {
 	serviceToken = ""
 	called := false
 	handler := requireServiceToken(func(w http.ResponseWriter, r *http.Request) {
@@ -1208,9 +1306,31 @@ func TestServiceToken_DevMode(t *testing.T) {
 	w := httptest.NewRecorder()
 	handler(w, req)
 
-	if !called {
-		t.Fatal("handler should be called in dev mode")
+	if called {
+		t.Fatal("handler must not be called without authentication")
 	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", w.Code)
+	}
+}
+
+func TestLoadServiceTokenRequiresOwnerOnlyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service-token")
+	credential := strings.Repeat("x", 32)
+	if err := os.WriteFile(path, []byte(credential), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SERVICE_TOKEN_PATH", path)
+	if err := loadServiceToken(); err == nil {
+		t.Fatal("group/world-readable token must be rejected")
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadServiceToken(); err != nil {
+		t.Fatalf("owner-only token rejected: %v", err)
+	}
+	serviceToken = ""
 }
 
 func TestServiceToken_InvalidToken(t *testing.T) {
@@ -1235,7 +1355,7 @@ func TestMetricsEndpoint(t *testing.T) {
 
 	mux := buildMux()
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/metrics", nil)
+	req := authenticatedTestRequest(http.MethodGet, "/v1/metrics", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -1337,7 +1457,7 @@ func TestIngestFromFile(t *testing.T) {
 // Corruption tolerance test
 // ---------------------------------------------------------------------------
 
-func TestEventStore_CorruptionRecovery(t *testing.T) {
+func TestEventStore_CorruptionFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	filePath := dir + "/events.jsonl"
 
@@ -1348,13 +1468,229 @@ func TestEventStore_CorruptionRecovery(t *testing.T) {
 	os.WriteFile(filePath, []byte(valid1+"\n"+corrupt+"\n"+valid2+"\n"), 0640)
 
 	store, err := NewEventStore(dir, RetentionConfig{})
+	if err == nil || store != nil {
+		t.Fatal("corrupt evidence must prevent recorder startup")
+	}
+}
+
+func TestRetentionRewriteKeepsFutureWritesDurable(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewEventStore(dir, RetentionConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().Add(-100 * 24 * time.Hour).Format(time.RFC3339Nano)
+	recent := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	if _, err := store.Record(Event{Timestamp: old, SessionID: "s1", Source: "test", Type: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Record(Event{Timestamp: recent, SessionID: "s1", Source: "test", Type: "recent"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Close()
+
+	store, err = NewEventStore(dir, RetentionConfig{ExpireAfterDays: 90})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Record(Event{SessionID: "s1", Source: "test", Type: "after-purge"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Close()
+
+	store, err = NewEventStore(dir, RetentionConfig{})
+	if err != nil {
+		t.Fatalf("reopen after retention and append: %v", err)
+	}
+	defer store.Close()
+	if store.EventCount() != 2 {
+		t.Fatalf("expected retained and post-purge events, got %d", store.EventCount())
+	}
+	if err := verifyEventChain(store.Query(EventFilter{})); err != nil {
+		t.Fatalf("rewritten chain is invalid: %v", err)
+	}
+}
+
+func TestEventStoreQueryReturnsDefensiveCopy(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewEventStore(dir, RetentionConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	recorded, err := store.Record(Event{SessionID: "s1", Source: "test", Type: "copy", Data: map[string]any{"value": "original"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queried := store.Query(EventFilter{})
+	queried[0].Data["value"] = "mutated"
+	again := store.Query(EventFilter{})
+	if again[0].Data["value"] != "original" || again[0].Hash != recorded.Hash {
+		t.Fatal("query result mutated stored evidence")
+	}
+}
 
-	// Should have loaded 2 events (skipped the corrupt line).
-	if store.EventCount() != 2 {
-		t.Fatalf("expected 2 events (skipping corrupt), got %d", store.EventCount())
+func TestIncidentStoreRejectsTraversalID(t *testing.T) {
+	store, err := NewIncidentStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(Incident{ID: "../escape", Title: "test"}); err == nil {
+		t.Fatal("path-traversal incident ID must be rejected")
+	}
+}
+
+func TestRedactedSignedBundleVerifies(t *testing.T) {
+	dir := t.TempDir()
+	privateKey := filepath.Join(dir, "recorder.key")
+	publicKey := filepath.Join(dir, "recorder.pub")
+	if err := generateKeypair(privateKey, publicKey); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewEventStore(dir, RetentionConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Record(Event{SessionID: "s1", Source: "test", Type: "email", Data: map[string]any{"address": "person@example.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := PackageBundle(&Incident{ID: "inc-1", SessionID: "s1", Title: "Redacted"}, store.Query(EventFilter{}), PrivacyProfileConfig{Redact: true}, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(mustJSON(t, bundle)), "person@example.com") {
+		t.Fatal("redacted bundle leaked source email")
+	}
+	if err := VerifyBundle(bundle, publicKey); err != nil {
+		t.Fatalf("redacted signed bundle did not verify: %v", err)
+	}
+	bundle.SignedAt = time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	if err := VerifyBundle(bundle, publicKey); err == nil {
+		t.Fatal("signed timestamp tampering must fail verification")
+	}
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestSelectIncidentEvents(t *testing.T) {
+	events := []Event{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	selected, err := SelectIncidentEvents(&Incident{EventIDs: []string{"b"}}, events)
+	if err != nil || len(selected) != 1 || selected[0].ID != "b" {
+		t.Fatalf("unexpected selection: %#v, %v", selected, err)
+	}
+	if _, err := SelectIncidentEvents(&Incident{EventIDs: []string{"missing"}}, events); err == nil {
+		t.Fatal("missing referenced evidence must fail closed")
+	}
+}
+
+func TestVerifyRecorderAuditRejectsUnknownAndTrailingJSON(t *testing.T) {
+	dir := t.TempDir()
+	entry := AuditEntry{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Action: "test"}
+	entry.Hash = computeRecorderAuditHash(entry)
+	data, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, line := range map[string][]byte{
+		"unknown":  append(append([]byte{}, data[:len(data)-1]...), []byte(`,"unexpected":true}`)...),
+		"trailing": append(append([]byte{}, data...), []byte(` {}`)...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(dir, name+".jsonl")
+			if err := os.WriteFile(path, append(line, '\n'), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := verifyRecorderAudit(path); err == nil {
+				t.Fatal("non-strict audit JSON must be rejected")
+			}
+		})
+	}
+}
+
+func TestRecorderAuditWriteFailurePoisonsHealth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditFile = f
+	auditRequired.Store(true)
+	auditHealthy.Store(true)
+	auditLastHash = ""
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		auditFile = nil
+		auditRequired.Store(false)
+		auditHealthy.Store(false)
+		auditLastHash = ""
+	})
+	if err := writeAudit(AuditEntry{Action: "test"}); err == nil {
+		t.Fatal("closed audit file must fail")
+	}
+	if auditAvailable() {
+		t.Fatal("audit failure must poison service health")
+	}
+}
+
+func TestIncidentStoreReadDirFailureFailsStartup(t *testing.T) {
+	original := readIncidentDirectory
+	readIncidentDirectory = func(string) ([]os.DirEntry, error) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	t.Cleanup(func() { readIncidentDirectory = original })
+	if _, err := NewIncidentStore(t.TempDir()); err == nil {
+		t.Fatal("incident directory read failure must prevent startup")
+	}
+}
+
+func TestRecorderRestartOnlyChangesAreRejected(t *testing.T) {
+	base := RecorderPolicy{Version: 1, Recorder: RecorderConfig{
+		DataDir:   "/var/lib/secure-ai/incidents",
+		Retention: RetentionConfig{MaxSessions: 10},
+		Daemon:    DaemonConfig{BindAddr: "127.0.0.1:8495"},
+	}}
+	for name, mutate := range map[string]func(*RecorderPolicy){
+		"data":      func(p *RecorderPolicy) { p.Recorder.DataDir = "/var/lib/secure-ai/other" },
+		"retention": func(p *RecorderPolicy) { p.Recorder.Retention.MaxSessions++ },
+		"daemon":    func(p *RecorderPolicy) { p.Recorder.Daemon.BindAddr = "127.0.0.1:9495" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := base
+			mutate(&candidate)
+			if !recorderRestartOnlyChanged(base, candidate) {
+				t.Fatal("restart-only change was accepted")
+			}
+		})
+	}
+}
+
+func TestCmdIngestPrevalidationRejectsWholeInput(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	policyPath := filepath.Join(dir, "policy.yaml")
+	policyYAML := "version: 1\nrecorder:\n  data_dir: " + dataDir + "\n"
+	if err := os.WriteFile(policyPath, []byte(policyYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+	inputPath := filepath.Join(dir, "input.jsonl")
+	input := "{\"timestamp\":\"2026-08-02T00:00:00Z\",\"tool\":\"filesystem.read\",\"allowed\":true}\n{broken\n"
+	if err := os.WriteFile(inputPath, []byte(input), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if code := cmdIngest(policyPath, inputPath, "tool-firewall", "ingest-test"); code == 0 {
+		t.Fatal("invalid JSONL input must return nonzero")
+	}
+	if eventStore == nil || eventStore.EventCount() != 0 {
+		t.Fatal("prevalidation failure must import zero events")
 	}
 }

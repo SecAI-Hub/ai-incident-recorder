@@ -27,19 +27,23 @@ We will acknowledge receipt within 48 hours and provide an initial assessment wi
 
 ai-incident-recorder follows defense-in-depth principles:
 
-- **Authentication**: All non-health HTTP endpoints require a bearer token (`SERVICE_TOKEN`)
+- **Authentication**: All non-health HTTP endpoints require a bearer token from the owner-only `SERVICE_TOKEN_PATH` file
 - **Constant-time token comparison**: `crypto/subtle.ConstantTimeCompare` prevents timing attacks
 - **Hardened HTTP server**: `http.Server` with read/write timeouts to prevent slowloris
 - **Request body limits**: `http.MaxBytesReader` caps request bodies (1 MiB single, 10 MiB batch)
 - **Schema validation**: Events and incidents are validated for severity/status enums, timestamp formats, source/type patterns, and session ID length
 - **Retention enforcement**: Configurable max events per session, max sessions, and expiry
 - **Hash chain integrity**: SHA-256 hash chains link events for tamper detection
-- **Ed25519 signing**: Case bundles are signed with Ed25519 keys for authenticity
+- **Ed25519 signing**: Case bundles are signed with Ed25519 keys and verification requires an independent trusted public key
 - **PII redaction**: Configurable redaction of SSNs, emails, credentials, bearer tokens, and credit cards
 - **Privacy profiles**: Named profiles (internal, external-share, legal-review) control bundle redaction levels
 - **Redaction consistency**: Both single and batch ingestion apply identical on-record redaction
-- **File store hardening**: fsync after writes, corruption-tolerant JSONL loading
+- **File store hardening**: fsync, atomic replacement, directory sync, defensive copies, safe-file checks, and fail-closed JSONL/hash-chain loading
 - **Rate limiting**: Per-minute request caps prevent abuse
+- **Audit fail-closed**: Strict bounded audit JSON is hash chained and fully verified; write/sync failure poisons health and blocks protected operations
+- **Portable audit checkpoints**: Offline exports are Ed25519-signed, payload-digested, chain-replayed, owner-only, and no-overwrite; recovery requires a separately retained prior head and writes only to a new path
+- **Storage poisoning**: Event append or fsync failure prevents all subsequent writes until controlled recovery
+- **Reload safety**: Data directory, retention, TTL, and daemon changes require restart instead of partially applying
 - **Non-root execution**: The container runs as UID 65534 (nobody)
 - **Localhost binding**: Daemon defaults to 127.0.0.1:8495
 
@@ -53,3 +57,5 @@ Key threats specific to ai-incident-recorder:
 - **Denial-of-service via storage**: Mitigated by retention limits (max events, max sessions, expiry)
 - **Slowloris / slow-read attacks**: Mitigated by hardened http.Server with read/write timeouts
 - **Schema injection**: Mitigated by structured validation of severity, status, source, type, timestamps
+
+Hash chains and signed checkpoints reveal modification but do not prevent an attacker who controls local storage and signing keys from deleting evidence or replaying an older signed checkpoint. Production deployments must separately retain the latest verified head and checkpoint in encrypted, access-controlled WORM/object-lock storage with an organization-selected retention period.

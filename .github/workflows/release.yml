@@ -1,0 +1,135 @@
+name: Signed release
+
+on:
+  push:
+    tags:
+      - "v*"
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-tag:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require an annotated strict SemVer tag on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          core_number='(0|[1-9][0-9]*)'
+          prerelease_identifier='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          build_identifier='[0-9A-Za-z-]+'
+          semver="^v${core_number}\.${core_number}\.${core_number}(-${prerelease_identifier}(\.${prerelease_identifier})*)?(\+${build_identifier}(\.${build_identifier})*)?$"
+          test "$GITHUB_REF_TYPE" = "tag"
+          [[ "$GITHUB_REF_NAME" =~ $semver ]]
+          tag_ref_json="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")"
+          test "$(jq -r '.object.type' <<<"$tag_ref_json")" = "tag"
+          tag_object_sha="$(jq -r '.object.sha' <<<"$tag_ref_json")"
+          tag_json="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha")"
+          test "$(jq -r '.tag' <<<"$tag_json")" = "$GITHUB_REF_NAME"
+          test "$(jq -r '.object.type' <<<"$tag_json")" = "commit"
+          tagged_commit="$(jq -r '.object.sha' <<<"$tag_json")"
+          test "$tagged_commit" = "$GITHUB_SHA"
+          git show-ref --verify --quiet refs/remotes/origin/main
+          git merge-base --is-ancestor "$tagged_commit" refs/remotes/origin/main
+
+  verify:
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.26.5"
+      - name: Verify and test source
+        run: |
+          go mod verify
+          go test -race -count=1 -timeout=10m ./...
+
+  release:
+    needs: [verify-tag, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      BINARY_NAME: ai-incident-recorder
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.26.5"
+      - name: Build release binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build \
+              -trimpath -ldflags="-s -w -buildid=" \
+              -o "dist/$BINARY_NAME-linux-$arch" .
+          done
+      - name: Generate CycloneDX SBOM
+        run: |
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0
+          cyclonedx-gomod mod -json -output "dist/$BINARY_NAME-sbom.cdx.json" .
+      - name: Generate checksum manifest
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum "$BINARY_NAME"-linux-* "$BINARY_NAME"-sbom.cdx.json > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+          )
+      - name: Sign checksum manifest with Sigstore
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          go install github.com/sigstore/cosign/v2/cmd/cosign@v2.6.4
+          cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+          cosign verify-blob \
+            --bundle dist/SHA256SUMS.sigstore.json \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME" \
+            dist/SHA256SUMS
+      - name: Attest release provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            dist/*-linux-*
+            dist/*-sbom.cdx.json
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sigstore.json
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          fi

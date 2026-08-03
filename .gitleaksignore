@@ -1,0 +1,2 @@
+# Historical false positive: a synthetic credential used only to verify redaction.
+cfca8308774ec237527aa0f5060b9462079b0c24:main_test.go:generic-api-key:244
