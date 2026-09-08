@@ -83,7 +83,8 @@ func RedactMap(data map[string]interface{}, rules []RedactionRule, stats *Redact
 	sort.Strings(keys)
 	for _, key := range keys {
 		redactedKey := RedactString(key, rules, stats)
-		if sensitiveJSONKey.MatchString(redactedKey) {
+		sensitive := sensitiveJSONKey.MatchString(key) || sensitiveJSONKey.MatchString(redactedKey)
+		if sensitive {
 			redactedKey = "[REDACTED:key]"
 			if stats != nil {
 				stats.Counts["json_key"]++
@@ -99,7 +100,13 @@ func RedactMap(data map[string]interface{}, rules []RedactionRule, stats *Redact
 				stats.Counts["key_collision"]++
 			}
 		}
-		redacted[redactedKey] = redactValue(data[key], rules, stats)
+		if sensitive {
+			// A credential value is sensitive even when it is opaque and does
+			// not itself match a text pattern. This also removes nested values.
+			redacted[redactedKey] = "[REDACTED:value]"
+		} else {
+			redacted[redactedKey] = redactValue(data[key], rules, stats)
+		}
 	}
 	return redacted
 }

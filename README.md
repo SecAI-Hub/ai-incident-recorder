@@ -15,13 +15,13 @@ Redacting on record permanently removes raw evidence. Prefer packaging-time reda
 
 ## Development
 
-Go 1.25 or newer is required for descriptor-rooted checkpoint filesystem
-operations; CI and production images use Go 1.26.5.
+Go 1.26.8 or newer is required for descriptor-rooted checkpoint filesystem
+operations; CI and production images use Go 1.27.1.
 
 ```sh
 go test -race ./...
 go vet ./...
-go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 ```
 
 Create keys and verify a bundle with a trusted key:
